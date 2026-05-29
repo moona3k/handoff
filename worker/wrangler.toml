@@ -17,8 +17,7 @@ workers_dev = true
 
 [[kv_namespaces]]
 binding = "HANDOFFS"
-id = "PLACEHOLDER_RUN_kv_namespace_create"
-# preview_id = "PLACEHOLDER_FOR_REMOTE_DEV"
+id = "ee072d67a4c34ed7bfb00bae244b4681"
 
 # --- Custom domain (set after choosing/registering one) -----------------------
 # Once the domain's zone is on Cloudflare, uncomment and deploy:
