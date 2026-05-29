@@ -11,7 +11,9 @@
 #   --endpoint URL / $HANDOFF_ENDPOINT  -> your own handoff Worker
 #   (default)              -> secret GitHub gist
 #
-# Set HANDOFF_ENDPOINT=https://your-domain to make your Worker the default backend.
+# Set HANDOFF_ENDPOINT=https://your-domain to make your Worker the default backend,
+# or persist it to ~/.config/handoff/endpoint (used when the env var isn't set —
+# handy because non-interactive shells don't source ~/.zshrc).
 #
 # Requires: gh (authenticated) for gist mode; curl for paste/endpoint modes.
 
@@ -39,6 +41,13 @@ done
 
 [[ -n "$FILE" ]] || { echo "ERROR: no file given. usage: publish.sh <file> [--endpoint URL|--public-paste|--gist]" >&2; exit 2; }
 [[ -f "$FILE" ]] || { echo "ERROR: file not found: $FILE" >&2; exit 2; }
+
+# Fall back to a saved endpoint if not set via $HANDOFF_ENDPOINT or --endpoint.
+# (Claude Code's non-interactive shell doesn't source ~/.zshrc, so we persist it here.)
+if [[ -z "$ENDPOINT" ]]; then
+  CFG="${XDG_CONFIG_HOME:-$HOME/.config}/handoff/endpoint"
+  [[ -f "$CFG" ]] && ENDPOINT="$(tr -d '[:space:]' < "$CFG")"
+fi
 
 # Resolve backend if not explicitly chosen.
 if [[ -z "$MODE" ]]; then
