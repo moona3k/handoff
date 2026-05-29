@@ -1,0 +1,30 @@
+# Cloudflare Worker config for the handoff short-URL service.
+#
+# Before first deploy:
+#   1. npm install
+#   2. npx wrangler kv namespace create HANDOFFS
+#      -> paste the printed id below (and into preview_id for `wrangler dev --remote`)
+#   3. (optional) set your custom domain in [[routes]] below, then `npx wrangler deploy`
+#
+# Local dev (`npm run dev`) simulates KV locally and does NOT need a real id.
+
+name = "handoff"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+
+# Strip the worker of the default *.workers.dev preview if you only want the custom domain:
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "HANDOFFS"
+id = "PLACEHOLDER_RUN_kv_namespace_create"
+# preview_id = "PLACEHOLDER_FOR_REMOTE_DEV"
+
+# --- Custom domain (set after choosing/registering one) -----------------------
+# Once the domain's zone is on Cloudflare, uncomment and deploy:
+# [[routes]]
+# pattern = "ctxhop.dev"
+# custom_domain = true
+
+[observability]
+enabled = true
