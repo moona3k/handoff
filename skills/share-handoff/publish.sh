@@ -89,6 +89,7 @@ case "$MODE" in
     echo "Published (your handoff service):"
     echo "  raw      : $URL"
     echo "  rendered : ${URL}?view"
+    echo "  feedback : ${URL}/feedback?format=md   (pull recipients' replies back later)"
     [[ -n "$DKEY" ]] && echo "  delete   : curl -X DELETE -H \"X-Delete-Key: $DKEY\" $URL"
     ;;
   paste)

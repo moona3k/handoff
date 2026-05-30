@@ -19,6 +19,15 @@ workers_dev = true
 binding = "HANDOFFS"
 id = "ee072d67a4c34ed7bfb00bae244b4681"
 
+# Feedback threads (replies on a capsule) live in D1; capsule bodies stay in KV.
+# Apply schema before first deploy:
+#   npx wrangler d1 execute handoff-db --local  --file=schema.sql
+#   npx wrangler d1 execute handoff-db --remote --file=schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "handoff-db"
+database_id = "8f553007-e8f2-4278-bd37-ac90c889a57b"
+
 # --- Custom domain (set after choosing/registering one) -----------------------
 # Once the domain's zone is on Cloudflare, uncomment and deploy:
 # [[routes]]
