@@ -1,59 +1,44 @@
 /**
  * handoff — a short-URL service for portable AI agent context handoffs,
- * with a typed feedback loop so recipients (humans or agents) can reply
- * and the originating agent can pull those replies back in.
+ * with a typed feedback loop and an MCP surface.
  *
  * Capsule routes:
  *   POST   /                      body = markdown handoff doc -> { url, view_url, delete_key }
  *   GET    /<slug>                -> raw markdown   (for agents; text/markdown, nosniff)
- *   GET    /<slug>?view           -> rendered HTML  (for humans; CSP-locked) + feedback thread + reply form
+ *   GET    /<slug>?view           -> rendered HTML  (humans; CSP-locked) + feedback thread + reply form
  *   GET    /<slug>.md             -> raw markdown   (alias)
- *   DELETE /<slug>                + X-Delete-Key    -> delete capsule
+ *   DELETE /<slug>                + X-Delete-Key    -> delete capsule (+ its feedback)
  *
  * Feedback routes:
  *   POST   /<slug>/feedback       form -> 303 to ?view#fb ; JSON -> 201 { id, kind, created }
- *   GET    /<slug>/feedback       -> JSON list (default) ; ?format=md / Accept: text/markdown -> md digest
- *   DELETE /<slug>/feedback/<fid> + X-Delete-Key (capsule owner) -> soft-hide a reply
+ *   GET    /<slug>/feedback       -> JSON list ; ?format=md / Accept: text/markdown -> md digest
+ *   DELETE /<slug>/feedback/<fid> + X-Delete-Key (owner) -> soft-hide a reply
+ *
+ * MCP route:
+ *   POST/GET /mcp                 -> stateless Streamable HTTP MCP server (see mcp.js)
  *
  * Create options (query param or header):
  *   ttl=<seconds> | X-TTL        expiry, clamped to [60, 31536000], default 30 days
  *   skipscan      | X-Skip-Scan  bypass the server-side secret scan
  *   Accept: application/json     -> JSON response instead of bare URL text
  *
- * Storage:
- *   KV (HANDOFFS) — capsule body (value = markdown, metadata = { created, deleteKeyHash, bytes }).
- *   D1 (DB)       — feedback rows (one thread per capsule slug).
+ * Storage: KV (HANDOFFS) holds capsule bodies; D1 (DB) holds feedback. All the
+ * data logic + security rules live in store.js so the HTTP routes here and the
+ * MCP tools in mcp.js share exactly one implementation.
  */
 
 import { marked } from 'marked';
-
-// Unambiguous base-57 alphabet (no 0/O/1/l/I) for human-friendly slugs.
-const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-const SLUG_LEN = 6;
-const DEFAULT_TTL = 60 * 60 * 24 * 30; // 30 days
-const MIN_TTL = 60; // KV minimum expirationTtl
-const MAX_TTL = 60 * 60 * 24 * 365; // 1 year
-const MAX_BYTES = 1024 * 1024; // 1 MiB — handoffs should be summaries, not dumps
-
-const MAX_FEEDBACK_BYTES = 8 * 1024; // 8 KiB per reply
-const RATE_LIMIT_PER_HOUR = 20; // replies per hashed-IP per capsule per hour
-// comment is first => it is the default-selected dropdown option and the validation fallback.
-const FEEDBACK_KINDS = ['comment', 'question', 'correction', 'approval', 'concern', 'idea', 'impl_note'];
-
-const SECRET_PATTERNS = [
-  /(?:secret|token|passwd|password|api[_-]?key|access[_-]?key|client[_-]?secret|bearer)["' ]*[:=][ "']*[A-Za-z0-9/_+-]{16,}/i,
-  /AKIA[0-9A-Z]{16}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /gh[pousr]_[A-Za-z0-9]{20,}/,
-  /sk-[A-Za-z0-9]{20,}/,
-  /xox[baprs]-[A-Za-z0-9-]{10,}/,
-];
+import * as store from './store.js';
+import { mcpHandler } from './mcp.js';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
     const method = request.method;
+
+    // MCP first — createMcpHandler manages its own CORS/preflight for /mcp.
+    if (pathname === '/mcp') return mcpHandler(request, env, ctx);
 
     if (method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
 
@@ -71,7 +56,7 @@ export default {
     // --- /<slug>/feedback  and  /<slug>/feedback/<fid> --------------------------
     if (parts.length >= 2 && parts[1] === 'feedback') {
       const slug = parts[0];
-      if (!isSlug(slug)) return notFound();
+      if (!store.isSlug(slug)) return notFound();
       if (parts.length === 2) {
         if (method === 'POST') return cors(await handleFeedbackCreate(slug, request, env, url));
         if (method === 'GET') return cors(await handleFeedbackList(slug, request, env, url));
@@ -87,18 +72,18 @@ export default {
     // --- /<slug>  (single segment, optional .md) --------------------------------
     if (parts.length !== 1) return notFound();
     const slug = parts[0].replace(/\.md$/, '');
-    if (!isSlug(slug)) return notFound();
+    if (!store.isSlug(slug)) return notFound();
 
     if (method === 'DELETE') return handleDelete(slug, request, env);
     if (method !== 'GET' && method !== 'HEAD') return text('method not allowed', 405);
 
-    const { value, metadata } = await env.HANDOFFS.getWithMetadata(slug);
-    if (value === null) return notFound();
+    const c = await store.getCapsule(env, slug);
+    if (!c) return notFound();
 
-    if (url.searchParams.has('view')) return renderView(slug, value, metadata, url, env);
+    if (url.searchParams.has('view')) return renderView(slug, c.markdown, c.metadata, url, env);
 
     return cors(
-      new Response(method === 'HEAD' ? null : value, {
+      new Response(method === 'HEAD' ? null : c.markdown, {
         headers: {
           'content-type': 'text/markdown; charset=utf-8',
           'x-content-type-options': 'nosniff',
@@ -113,50 +98,35 @@ export default {
 
 async function handleCreate(request, env, url) {
   const body = await readBody(request);
-  if (!body) return text('empty body', 400);
-
-  const bytes = new TextEncoder().encode(body).length;
-  if (bytes > MAX_BYTES) return text(`payload too large: ${bytes} bytes (max ${MAX_BYTES})`, 413);
-
   const skip = request.headers.get('x-skip-scan') === '1' || url.searchParams.has('skipscan');
-  if (!skip) {
-    const hits = scanSecrets(body);
-    if (hits.length) {
-      return text(
-        'Possible secrets detected — not stored. Redact, or resend with header `X-Skip-Scan: 1`:\n' +
-          hits.join('\n'),
-        422,
-      );
-    }
+  const ttl = url.searchParams.get('ttl') ?? request.headers.get('x-ttl');
+
+  const r = await store.createCapsule(env, { body, ttl, skipScan: skip });
+  if (r.error === 'empty') return text('empty body', 400);
+  if (r.error === 'toolarge') return text(`payload too large: ${r.bytes} bytes (max ${store.MAX_BYTES})`, 413);
+  if (r.error === 'secrets') {
+    return text(
+      'Possible secrets detected — not stored. Redact, or resend with header `X-Skip-Scan: 1`:\n' + r.hits.join('\n'),
+      422,
+    );
   }
 
-  const ttl = clampTtl(url.searchParams.get('ttl') ?? request.headers.get('x-ttl'));
-  const slug = await uniqueSlug(env);
-  const deleteKey = randomToken(16);
-  const metadata = {
-    created: new Date().toISOString(),
-    deleteKeyHash: await sha256hex(deleteKey),
-    bytes,
-  };
-  await env.HANDOFFS.put(slug, body, { expirationTtl: ttl, metadata });
-
-  const link = `${url.origin}/${slug}`;
+  const link = `${url.origin}/${r.slug}`;
   const payload = {
     url: link,
     raw_url: link,
     view_url: `${link}?view`,
     feedback_url: `${link}/feedback`,
-    slug,
-    delete_key: deleteKey,
-    bytes,
-    expires_in: ttl,
+    slug: r.slug,
+    delete_key: r.deleteKey,
+    bytes: r.bytes,
+    expires_in: r.ttl,
   };
 
-  const extraHeaders = { 'x-delete-key': deleteKey, 'x-view-url': payload.view_url };
+  const extraHeaders = { 'x-delete-key': r.deleteKey, 'x-view-url': payload.view_url };
   if ((request.headers.get('accept') || '').includes('application/json')) {
     return json(payload, 201, extraHeaders);
   }
-  // Default: bare URL on stdout so `URL=$(curl ...)` just works.
   return new Response(link + '\n', {
     status: 201,
     headers: { 'content-type': 'text/plain; charset=utf-8', ...extraHeaders },
@@ -164,23 +134,16 @@ async function handleCreate(request, env, url) {
 }
 
 async function handleDelete(slug, request, env) {
-  const { value, metadata } = await env.HANDOFFS.getWithMetadata(slug);
-  if (value === null) return notFound();
-  if (!(await isOwner(request, metadata))) return text('invalid or missing X-Delete-Key', 403);
-  await env.HANDOFFS.delete(slug);
-  // Best-effort: drop the capsule's feedback thread too.
-  try {
-    await env.DB.prepare('DELETE FROM feedback WHERE capsule = ?').bind(slug).run();
-  } catch (_) {}
+  const key = request.headers.get('x-delete-key') || '';
+  const r = await store.deleteCapsule(env, slug, key);
+  if (r === 'notfound') return notFound();
+  if (r === 'forbidden') return text('invalid or missing X-Delete-Key', 403);
   return text('deleted', 200);
 }
 
 // --- feedback ----------------------------------------------------------------
 
 async function handleFeedbackCreate(slug, request, env, url) {
-  const { value } = await env.HANDOFFS.getWithMetadata(slug);
-  if (value === null) return notFound();
-
   const ct = request.headers.get('content-type') || '';
   const isForm = ct.includes('application/x-www-form-urlencoded') || ct.includes('multipart/form-data');
 
@@ -201,106 +164,48 @@ async function handleFeedbackCreate(slug, request, env, url) {
     ({ kind, body, author, contact } = data || {});
   }
 
-  kind = normalizeKind(kind);
-  body = (typeof body === 'string' ? body : '').trim();
-  author = clip(author, 80);
-  contact = clip(contact, 200);
-
-  if (!body) return text('feedback body is required', 400);
-  if (new TextEncoder().encode(body).length > MAX_FEEDBACK_BYTES) {
-    return text(`feedback too long (max ${MAX_FEEDBACK_BYTES} bytes)`, 413);
-  }
-
-  // Rate-limit by hashed IP + capsule (one bucket per replier per thread).
   const ip = request.headers.get('cf-connecting-ip') || '0.0.0.0';
-  const ipHash = await sha256hex(ip + ':' + slug);
-  const since = new Date(Date.now() - 3600 * 1000).toISOString();
-  const rl = await env.DB.prepare('SELECT COUNT(*) AS n FROM feedback WHERE ip_hash = ? AND created > ?')
-    .bind(ipHash, since)
-    .first();
-  if ((rl?.n ?? 0) >= RATE_LIMIT_PER_HOUR) {
-    return text('rate limit: too many replies from your network in the last hour — try later', 429);
-  }
-
-  const id = randomToken(10);
-  const created = new Date().toISOString();
-  await env.DB.prepare(
-    'INSERT INTO feedback (id, capsule, kind, body, author, contact, created, ip_hash, hidden) VALUES (?,?,?,?,?,?,?,?,0)',
-  )
-    .bind(id, slug, kind, body, author || null, contact || null, created, ipHash)
-    .run();
+  const ipHash = await store.sha256hex(ip + ':' + slug);
+  const r = await store.postFeedback(env, { slug, kind, body, author, contact, ipHash });
+  if (r.error === 'notfound') return notFound();
+  if (r.error === 'empty') return text('feedback body is required', 400);
+  if (r.error === 'toolong') return text(`feedback too long (max ${store.MAX_FEEDBACK_BYTES} bytes)`, 413);
+  if (r.error === 'ratelimited') return text('rate limit: too many replies from your network in the last hour — try later', 429);
 
   if (isForm) {
-    // Browser: redirect back to the rendered view, anchored at the thread.
     return new Response(null, { status: 303, headers: { location: `${url.origin}/${slug}?view#fb` } });
   }
-  return json({ id, kind, created }, 201);
+  return json(r, 201);
 }
 
 async function handleFeedbackList(slug, request, env, url) {
-  const { value, metadata } = await env.HANDOFFS.getWithMetadata(slug);
-  if (value === null) return notFound();
+  const c = await store.getCapsule(env, slug);
+  if (!c) return notFound();
 
-  const owner = await isOwner(request, metadata, url);
-  const rows = await listFeedback(env, slug, owner);
+  const ownerKey = request.headers.get('x-delete-key') || url.searchParams.get('key') || '';
+  const owner = await store.ownerKeyMatches(c.metadata, ownerKey);
+  const rows = await store.listFeedback(env, slug, owner);
 
   const wantMd =
-    url.searchParams.get('format') === 'md' ||
-    (request.headers.get('accept') || '').includes('text/markdown');
+    url.searchParams.get('format') === 'md' || (request.headers.get('accept') || '').includes('text/markdown');
 
   if (wantMd) {
-    return new Response(feedbackMarkdown(slug, rows), {
+    return new Response(store.feedbackMarkdown(slug, rows), {
       headers: { 'content-type': 'text/markdown; charset=utf-8', 'x-content-type-options': 'nosniff' },
     });
   }
-  return json({
-    capsule: slug,
-    count: rows.length,
-    feedback: rows.map((r) => publicRow(r, owner)),
-  });
+  return json({ capsule: slug, count: rows.length, feedback: rows.map((r) => store.publicRow(r, owner)) });
 }
 
 async function handleFeedbackDelete(slug, fid, request, env) {
-  const { value, metadata } = await env.HANDOFFS.getWithMetadata(slug);
-  if (value === null) return notFound();
-  if (!(await isOwner(request, metadata))) return text('invalid or missing X-Delete-Key', 403);
-  await env.DB.prepare('UPDATE feedback SET hidden = 1 WHERE id = ? AND capsule = ?').bind(fid, slug).run();
+  const key = request.headers.get('x-delete-key') || '';
+  const r = await store.hideFeedback(env, slug, fid, key);
+  if (r === 'notfound') return notFound();
+  if (r === 'forbidden') return text('invalid or missing X-Delete-Key', 403);
   return text('hidden', 200);
 }
 
-async function listFeedback(env, slug, includeHidden) {
-  const sql = includeHidden
-    ? 'SELECT * FROM feedback WHERE capsule = ? ORDER BY created ASC'
-    : 'SELECT * FROM feedback WHERE capsule = ? AND hidden = 0 ORDER BY created ASC';
-  const { results } = await env.DB.prepare(sql).bind(slug).all();
-  return results || [];
-}
-
-function publicRow(r, owner) {
-  const out = { id: r.id, kind: r.kind, body: r.body, author: r.author || null, created: r.created };
-  if (owner) {
-    out.contact = r.contact || null;
-    out.hidden = !!r.hidden;
-  }
-  return out;
-}
-
-function feedbackMarkdown(slug, rows) {
-  if (!rows.length) return `# Feedback for ${slug}\n\n_No feedback yet._\n`;
-  const blocks = rows.map((r) => {
-    const who = r.author ? ` by ${r.author}` : '';
-    const when = r.created ? r.created.slice(0, 16).replace('T', ' ') + ' UTC' : '';
-    return `## [${r.kind}]${who} — ${when}\n\n${r.body}\n`;
-  });
-  return `# Feedback for ${slug} (${rows.length})\n\n` + blocks.join('\n');
-}
-
-function normalizeKind(k) {
-  k = (typeof k === 'string' ? k : '').trim().toLowerCase();
-  return FEEDBACK_KINDS.includes(k) ? k : 'comment';
-}
-
-// --- helpers -----------------------------------------------------------------
+// --- response helpers --------------------------------------------------------
 
 async function readBody(request) {
   // Treat the request body as the raw paste, like paste.rs/c-net — this is what
@@ -313,60 +218,6 @@ async function readBody(request) {
     return (typeof v === 'string' ? v : '').trim();
   }
   return (await request.text()).trim();
-}
-
-// Owner check: X-Delete-Key header (agents/CLI) or ?key= (browser links) hashes to the capsule's key.
-async function isOwner(request, metadata, url) {
-  const key = request.headers.get('x-delete-key') || (url && url.searchParams.get('key')) || '';
-  if (!key || !metadata || !metadata.deleteKeyHash) return false;
-  return (await sha256hex(key)) === metadata.deleteKeyHash;
-}
-
-function isSlug(s) {
-  return /^[A-Za-z0-9]{3,32}$/.test(s);
-}
-
-function clip(v, max) {
-  if (typeof v !== 'string') return '';
-  const t = v.trim();
-  return t.length > max ? t.slice(0, max) : t;
-}
-
-function randomToken(len) {
-  const bytes = new Uint8Array(len);
-  crypto.getRandomValues(bytes);
-  let out = '';
-  for (const b of bytes) out += ALPHABET[b % ALPHABET.length];
-  return out;
-}
-
-async function uniqueSlug(env) {
-  for (let i = 0; i < 5; i++) {
-    const slug = randomToken(SLUG_LEN);
-    if ((await env.HANDOFFS.get(slug)) === null) return slug;
-  }
-  return randomToken(SLUG_LEN + 2); // extremely unlikely fallback
-}
-
-function clampTtl(raw) {
-  const n = parseInt(raw ?? '', 10);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TTL;
-  return Math.min(Math.max(n, MIN_TTL), MAX_TTL);
-}
-
-function scanSecrets(text) {
-  const hits = [];
-  text.split('\n').forEach((line, i) => {
-    if (SECRET_PATTERNS.some((re) => re.test(line))) {
-      hits.push(`  line ${i + 1}: ${line.trim().slice(0, 80)}`);
-    }
-  });
-  return hits;
-}
-
-async function sha256hex(s) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function cors(resp) {
@@ -488,8 +339,8 @@ async function renderView(slug, md, metadata, url, env) {
     ? new Date(metadata.created).toISOString().slice(0, 16).replace('T', ' ')
     : '';
   const bodyHtml = marked.parse(md); // capsule author content (trusted-ish); CSP blocks any embedded script
-  const rows = await listFeedback(env, slug, false);
-  const nonce = randomToken(20);
+  const rows = await store.listFeedback(env, slug, false);
+  const nonce = store.randomToken(20);
 
   const bar = `<div class="bar"><span class="brand">handoff</span>
     <span>${created ? created + ' UTC' : ''}</span>
@@ -523,7 +374,7 @@ function renderThread(rows) {
 }
 
 function renderReplyForm(slug) {
-  const opts = FEEDBACK_KINDS.map((k) => `<option value="${k}">${k}</option>`).join('');
+  const opts = store.FEEDBACK_KINDS.map((k) => `<option value="${k}">${k}</option>`).join('');
   return `<form class="reply-form" method="POST" action="/${escapeHtml(slug)}/feedback">
     <h3>Add feedback</h3>
     <div class="row">
@@ -544,10 +395,11 @@ function renderAgentBox(rawUrl, fbUrl, nonce) {
     `  -H 'content-type: application/json' \\\n` +
     `  -d '{"kind":"comment","body":"…","author":"me"}'`;
   return `<details class="agent">
-    <summary>For agents / CLI</summary>
+    <summary>For agents / CLI / MCP</summary>
     <p>Raw handoff: <a href="${escapeHtml(rawUrl)}"><code>${escapeHtml(rawUrl)}</code></a><br>
        Feedback: <a href="${escapeHtml(fbUrl)}?format=md"><code>${escapeHtml(fbUrl)}?format=md</code></a>
-       &middot; <a href="${escapeHtml(fbUrl)}"><code>JSON</code></a></p>
+       &middot; <a href="${escapeHtml(fbUrl)}"><code>JSON</code></a><br>
+       MCP endpoint: <code>${escapeHtml(new URL(rawUrl).origin)}/mcp</code></p>
     <p>Paste into your agent:</p>
     <pre class="cli" id="prompt">${escapeHtml(prompt)}</pre>
     <button class="copy" data-target="prompt">Copy prompt</button>
@@ -596,12 +448,16 @@ curl -X POST https://${host}/aB3dE/feedback \\
 
 # the originating agent pulls replies back in
 curl https://${host}/aB3dE/feedback?format=md</pre>
+      <h2>For agents (MCP)</h2>
+      <p>Add <code>https://${host}/mcp</code> as a remote MCP server (Streamable HTTP) in ChatGPT,
+      Claude, or any MCP client. Tools: <code>handoff_create</code>, <code>handoff_get</code>,
+      <code>handoff_feedback_post</code>, <code>handoff_feedback_list</code>.</p>
       <h2>What it does for you</h2>
       <ul>
         <li>Short URLs · raw markdown for agents, rendered view for humans</li>
         <li>Typed feedback (question / correction / approval / concern / idea / note) back to the agent</li>
-        <li>Server-side secret scan (rejects obvious keys/tokens unless you opt out)</li>
-        <li>Expiring by default · delete key returned at creation</li>
+        <li>Usable from the web, CLI, and MCP (humans and agents, same capsule)</li>
+        <li>Server-side secret scan · expiring by default · delete key at creation</li>
         <li>Self-hostable on the Cloudflare free tier</li>
       </ul>
       <p><a href="https://github.com/moona3k/handoff">Source &amp; the handoff doc schema on GitHub →</a></p>

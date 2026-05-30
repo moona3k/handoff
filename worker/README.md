@@ -28,6 +28,17 @@ originating agent can pull back in. Runs comfortably on the Cloudflare free tier
 `contact` (optional "notify me" handle) is private — returned only to the capsule owner
 (send `X-Delete-Key`), never in public lists or the markdown digest.
 
+**MCP** — a stateless [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) MCP server, same data, for agents that speak MCP (ChatGPT, Claude, MCP Inspector, …).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST`/`GET` | `/mcp` | MCP endpoint. Tools: `handoff_create`, `handoff_get`, `handoff_feedback_post`, `handoff_feedback_list`, `handoff_delete`, `handoff_feedback_hide`. |
+
+Add `https://YOUR-DOMAIN/mcp` as a remote MCP server in any client. Stateless (no sessions /
+no Durable Objects); built with the official MCP SDK via Cloudflare's `createMcpHandler`. The
+tool layer is a thin wrapper over the same `store.js` operations the HTTP routes use, so it
+inherits the secret scan, feedback cap, rate-limit, and owner-key checks. See [`../docs/MCP.md`](../docs/MCP.md).
+
 Create options: `?ttl=<seconds>` or `X-TTL` (clamped to 60s–1yr, default 30d);
 `X-Skip-Scan: 1` or `?skipscan` to bypass the server-side secret scan.
 
@@ -55,12 +66,16 @@ npx wrangler d1 create handoff-db
 npx wrangler d1 execute handoff-db --local  --file=schema.sql
 npx wrangler d1 execute handoff-db --remote --file=schema.sql
 
-# 3. deploy
+# 3. deploy  (wrangler.toml already sets compatibility_flags = ["nodejs_compat"],
+#            required by the `agents` SDK that powers the /mcp endpoint)
 npx wrangler deploy
 
 # 4. custom domain: add the zone to Cloudflare, then uncomment the [[routes]]
 #    block in wrangler.toml (pattern = "your-domain", custom_domain = true) and re-deploy.
 ```
+
+Dependencies: `marked` (render), `@modelcontextprotocol/sdk` + `agents` + `zod` (the `/mcp`
+endpoint). `nodejs_compat` is required for the `agents` SDK.
 
 ## Local dev
 

@@ -11,6 +11,8 @@
 name = "handoff"
 main = "src/index.js"
 compatibility_date = "2026-05-01"
+# nodejs_compat is required by the `agents` SDK (used for the /mcp Streamable HTTP transport).
+compatibility_flags = ["nodejs_compat"]
 
 # Strip the worker of the default *.workers.dev preview if you only want the custom domain:
 workers_dev = true

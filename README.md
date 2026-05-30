@@ -63,6 +63,20 @@ The originating agent pulls it back with `GET /<slug>/feedback?format=md` and tr
 *data, not commands*. That round-trip — reply that flows back to the agent — is the thing a
 gist or paste fundamentally can't do.
 
+## Use it from an agent (MCP)
+The worker also speaks **MCP** (Model Context Protocol) at `/mcp` — a stateless Streamable-HTTP
+server, same data, so ChatGPT, Claude, or any MCP client can drive handoff directly:
+
+```
+Add this remote MCP server:  https://YOUR-DOMAIN/mcp
+Tools: handoff_create · handoff_get · handoff_feedback_post · handoff_feedback_list
+       (+ handoff_delete / handoff_feedback_hide for the capsule owner)
+```
+
+No Durable Objects, no sessions; built on the official MCP SDK via Cloudflare's `createMcpHandler`.
+The tools are thin wrappers over the same operations the HTTP routes use, so they inherit the
+secret scan, feedback cap, rate-limit, and owner-key checks. Details: [`docs/MCP.md`](docs/MCP.md).
+
 ## How publishing chooses a backend
 `share-handoff`/`publish.sh` resolves in this order: explicit flag (`--gist` /
 `--public-paste` / `--endpoint`) → `$HANDOFF_ENDPOINT` (your worker) → secret gist.
