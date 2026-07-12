@@ -8,9 +8,9 @@ up exactly where you left off. Free, open source, no lock-in.
 
 ```
 you$  (in your agent)  "hand off this session"
-      → https://ctxhop.dev/aB3dE
+      → https://handoff.moona3k.workers.dev/aB3dE
 
-them$ (in their agent) "read https://ctxhop.dev/aB3dE and continue"
+them$ (in their agent) "read https://handoff.moona3k.workers.dev/aB3dE and continue"
       → their agent fetches it and resumes
       → they reply with typed feedback (correction / approval / question / …)
 
